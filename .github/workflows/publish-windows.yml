@@ -17,10 +17,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out release source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -46,3 +46,28 @@ jobs:
         run: npm run electron:publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify update files are attached to the release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+          $installer = "Pharmacy-POS-Setup-$tagVersion.exe"
+          $requiredAssets = @($installer, "$installer.blockmap", "latest.yml")
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME"
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $missing = $requiredAssets
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers
+            $assetNames = @($release.assets | ForEach-Object { $_.name })
+            $missing = @($requiredAssets | Where-Object { $_ -notin $assetNames })
+            if ($missing.Count -eq 0) { break }
+            if ($attempt -lt 12) { Start-Sleep -Seconds 5 }
+          }
+          if ($missing.Count -gt 0) {
+            throw ("Release {0} is missing required update assets: {1}" -f $env:GITHUB_REF_NAME, ($missing -join ', '))
+          }

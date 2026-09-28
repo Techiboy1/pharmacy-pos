@@ -1,7 +1,7 @@
 {
   "name": "pharmacy-pos",
   "private": true,
-  "version": "1.0.8",
+  "version": "1.0.9",
   "type": "module",
   "main": "main.js",
   "scripts": {
@@ -33,7 +33,8 @@
       {
         "provider": "github",
         "owner": "Techiboy1",
-        "repo": "pharmacy-pos"
+        "repo": "pharmacy-pos",
+        "releaseType": "release"
       }
     ],
     "win": {
