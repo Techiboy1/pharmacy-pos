@@ -10,6 +10,11 @@ export default defineConfig(({ mode }) => {
       __PHARMACY_DEMO_MODE__: JSON.stringify(mode === 'demo'),
     },
     plugins: [react()],
+    server: {
+      watch: {
+        ignored: ['**/release/**'],
+      },
+    },
     resolve: {
       alias: {
         '@': fileURLToPath(new URL('./src', import.meta.url)),
