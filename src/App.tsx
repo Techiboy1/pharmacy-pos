@@ -163,7 +163,7 @@ function App() {
         </div>
       )}
 
-      <div className="flex flex-1 min-h-0 min-w-0">
+      <div className="flex flex-1 min-h-0 min-w-0 flex-col">
         {/* Top Navigation Bar with Permission Guard */}
         <Sidebar page={page} onNavigate={handleNavigate} storeName={storeName} />
 
