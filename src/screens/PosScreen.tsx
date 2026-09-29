@@ -470,7 +470,7 @@ export function PosScreen({ settings }: { settings: StoreSettings | null }) {
     }
     setBusy(true);
     const invoiceNo = generateInvoiceNo();
-    const currentCashier = localStorage.getItem('pos_active_user') || 'TECHI';
+    const currentCashier = localStorage.getItem('pos_active_user') || settings?.name || 'Pharmacy Store';
 
     const saleRow = {
       invoice_no: invoiceNo,

@@ -16,7 +16,14 @@ import { NetworkScreen } from '@/screens/NetworkScreen';
 import { LicenseModal } from './components/LicenseModal';
 import { SplashScreen } from './components/SplashScreen';
 import { checkCurrentLicense } from './utils/licenseManager';
-import { supabase } from '@/lib/supabase';
+import { getNetworkRole, supabase } from '@/lib/supabase';
+import {
+  COUNTER_PERMISSION_CACHE_KEY,
+  COUNTER_PERMISSION_RECORD_ID,
+  isCounterModuleRestricted,
+  normalizeCounterPermissions,
+  readCachedCounterPermissions,
+} from '@/utils/counterPermissions';
 
 function App() {
   const isDemoMode = __PHARMACY_DEMO_MODE__;
@@ -24,6 +31,9 @@ function App() {
   const [showSplash, setShowSplash] = useState<boolean>(true);
   const [page, setPage] = useState<Page>('pos');
   const { settings, setSettings, loading } = useStoreSettings();
+  const [counterPermissions, setCounterPermissions] = useState(() => readCachedCounterPermissions());
+  const [networkRole, setNetworkRole] = useState(() => getNetworkRole());
+  const [isMasterAdmin, setIsMasterAdmin] = useState(() => localStorage.getItem('is_master_admin') === 'true');
 
   // Permission Request Modal State for Counter PC
   const [blockedPage, setBlockedPage] = useState<Page | null>(null);
@@ -34,18 +44,13 @@ function App() {
 
   // Check if current device is Counter PC
   function isCounterPC(): boolean {
-    const role = localStorage.getItem('pos_device_role') || '';
-    const user = localStorage.getItem('pos_active_user') || '';
-    if (role.toLowerCase().includes('counter') || user.toLowerCase().includes('counter')) {
-      return true;
-    }
-    return false;
+    return networkRole === 'client' || localStorage.getItem('pos_device_role') === 'counter';
   }
 
-  // Handle Protected Navigation (Only lock Sales & Reports and Top Selling)
+  // Apply the Main Server's current permissions to every navigation route.
   function handleNavigate(targetPage: Page) {
     const isCounter = isCounterPC();
-    const isRestricted = targetPage === 'sales' || targetPage === 'fast-moving';
+    const isRestricted = isCounterModuleRestricted(targetPage, counterPermissions);
 
     if (isCounter && isRestricted) {
       const grantedToken = sessionStorage.getItem(`one_time_access_${targetPage}`);
@@ -68,7 +73,7 @@ function App() {
     if (!blockedPage) return;
     setRequestStatus('pending');
 
-    const cashierName = localStorage.getItem('pos_active_user') || 'Counter Man';
+    const cashierName = localStorage.getItem('pos_active_user') || storeName || 'Pharmacy Store';
     const localReqId = `req_${Date.now()}`;
     const reqPayload = {
       id: localReqId,
@@ -87,6 +92,63 @@ function App() {
       await supabase.from('counter_access_requests').insert([reqPayload]);
     } catch {}
   }
+
+  useEffect(() => {
+    const updateRole = () => setNetworkRole(getNetworkRole());
+    window.addEventListener('pos-network-role-changed', updateRole);
+    window.addEventListener('storage', updateRole);
+    return () => {
+      window.removeEventListener('pos-network-role-changed', updateRole);
+      window.removeEventListener('storage', updateRole);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCounterPC()) return;
+    let mounted = true;
+    const refresh = async () => {
+      try {
+        const { data } = await supabase
+          .from('counter_module_permissions')
+          .select('*')
+          .eq('id', COUNTER_PERMISSION_RECORD_ID)
+          .maybeSingle();
+        if (mounted && data?.permissions) {
+          const normalized = normalizeCounterPermissions(data.permissions);
+          setCounterPermissions(normalized);
+          localStorage.setItem(COUNTER_PERMISSION_CACHE_KEY, JSON.stringify(normalized));
+        }
+      } catch {
+        // Retain the last local permission snapshot while the LAN server is unavailable.
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(refresh, 2500);
+    return () => {
+      mounted = false;
+      window.clearInterval(interval);
+    };
+  }, [networkRole]);
+
+  useEffect(() => {
+    if (!isCounterPC() || !isCounterModuleRestricted(page, counterPermissions)) return;
+    const oneTimeToken = `one_time_access_${page}`;
+    if (sessionStorage.getItem(oneTimeToken) === 'granted') {
+      sessionStorage.removeItem(oneTimeToken);
+      return;
+    }
+    setPage('pos');
+    setBlockedPage(page);
+    setRequestStatus('idle');
+  }, [page, networkRole, counterPermissions]);
+
+  useEffect(() => {
+    if (!blockedPage || !isCounterPC() || isCounterModuleRestricted(blockedPage, counterPermissions)) return;
+    setPage(blockedPage);
+    setBlockedPage(null);
+    setRequestStatus('idle');
+    setCurrentRequestId(null);
+  }, [blockedPage, networkRole, counterPermissions]);
 
   // Listen for Approval from Main Server
   useEffect(() => {
@@ -165,7 +227,13 @@ function App() {
 
       <div className="flex flex-1 min-h-0 min-w-0 flex-col">
         {/* Top Navigation Bar with Permission Guard */}
-        <Sidebar page={page} onNavigate={handleNavigate} storeName={storeName} />
+        <Sidebar
+          page={page}
+          onNavigate={handleNavigate}
+          storeName={storeName}
+          counterPermissions={counterPermissions}
+          onMasterAdminChange={setIsMasterAdmin}
+        />
 
         <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
           {/* Mobile top bar */}
@@ -202,13 +270,18 @@ function App() {
             ) : page === 'network' ? (
               <NetworkScreen />
             ) : (
-              <SettingsScreen settings={settings} setSettings={setSettings} />
+              <SettingsScreen
+                settings={settings}
+                setSettings={setSettings}
+                isMasterAdmin={isMasterAdmin}
+                onDeactivateLicense={() => setIsLicensed(false)}
+              />
             )}
           </main>
         </div>
       </div>
 
-      <MobileNav page={page} onNavigate={handleNavigate} />
+      <MobileNav page={page} onNavigate={handleNavigate} counterPermissions={counterPermissions} />
 
       {/* Permission Request Modal for Counter PC */}
       {blockedPage && (
@@ -221,7 +294,7 @@ function App() {
             <div>
               <h3 className="text-lg font-black text-slate-800">Permission Required</h3>
               <p className="text-xs text-slate-500 mt-1">
-                Aap <strong>{blockedPage === 'sales' ? 'Sales & Reports' : 'Top Selling'}</strong> screen access kar rahe hain. Is screen ke liye Main Server se approval lazmi hai.
+                Aap <strong>{blockedPage === 'sales' ? 'Sales & Reports' : blockedPage === 'fast-moving' ? 'Top Selling' : blockedPage}</strong> screen access kar rahe hain. Is screen ke liye Main Server se approval lazmi hai.
               </p>
             </div>
 

@@ -37,6 +37,22 @@ function parseDateKey(value: string): Date | null {
   return parsed;
 }
 
+function parseLicenseExpiry(value: string): Date | null {
+  const dateKey = parseDateKey(value);
+  if (dateKey) return dateKey;
+
+  // Accept legacy ISO timestamps and Unix timestamps stored in older trial keys.
+  const numeric = /^\d{10,13}$/.test(value) ? Number(value) : null;
+  const parsed = numeric === null
+    ? new Date(value)
+    : new Date(numeric < 100_000_000_000 ? numeric * 1000 : numeric);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function expiryIsDateOnly(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
 function addCalendarMonths(date: Date, months: number): Date {
   const targetMonth = new Date(date.getFullYear(), date.getMonth() + months, 1);
   const lastDayOfTargetMonth = new Date(
@@ -108,13 +124,16 @@ export function verifyLicenseKey(key: string): { valid: boolean; reason?: string
   }
 
   if (data.exp !== 'LIFETIME') {
-    const expiryDate = parseDateKey(data.exp);
+    const expiryDate = parseLicenseExpiry(data.exp);
     if (!expiryDate) {
       return { valid: false, reason: 'Invalid or corrupt License Key.' };
     }
 
     const todayDate = parseDateKey(toDateKey(new Date()));
-    if (!todayDate || expiryDate.getTime() < todayDate.getTime()) {
+    const expired = expiryIsDateOnly(data.exp)
+      ? !todayDate || expiryDate.getTime() < todayDate.getTime()
+      : expiryDate.getTime() < Date.now();
+    if (expired) {
       return { valid: false, reason: 'This license has expired!' };
     }
   }
@@ -144,16 +163,22 @@ export function getLicenseInfo(): LicenseInfo {
     return { status: 'active', expiry: null, isLifetime: true, daysLeft: null };
   }
 
-  const expiryDate = parseDateKey(data.exp);
+  const expiryDate = parseLicenseExpiry(data.exp);
   const todayDate = parseDateKey(toDateKey(new Date()));
   if (!expiryDate || !todayDate) {
     return { status: 'invalid', expiry: null, isLifetime: false, daysLeft: null };
   }
 
-  const difference = Math.round((expiryDate.getTime() - todayDate.getTime()) / 86_400_000);
-  if (difference < 0) {
-    return { status: 'expired', expiry: data.exp, isLifetime: false, daysLeft: 0 };
+  const displayExpiry = expiryIsDateOnly(data.exp)
+    ? data.exp
+    : toDateKey(expiryDate);
+  const expired = expiryIsDateOnly(data.exp)
+    ? expiryDate.getTime() < todayDate.getTime()
+    : expiryDate.getTime() < Date.now();
+  if (expired) {
+    return { status: 'expired', expiry: displayExpiry, isLifetime: false, daysLeft: 0 };
   }
 
-  return { status: 'active', expiry: data.exp, isLifetime: false, daysLeft: difference };
+  const difference = Math.ceil((expiryDate.getTime() - Date.now()) / 86_400_000);
+  return { status: 'active', expiry: displayExpiry, isLifetime: false, daysLeft: Math.max(0, difference) };
 }

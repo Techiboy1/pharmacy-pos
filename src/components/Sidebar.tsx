@@ -2,10 +2,12 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   ShoppingCart, Package, BarChart3, Settings as SettingsIcon, 
   Pill, Boxes, CalendarX, Lock, ShieldAlert, Loader2, X, Flame,
-  LayoutGrid, ChevronDown, User, LogOut, UserCheck, RotateCcw, Truck, Users, Network
+  LayoutGrid, ChevronDown, User, LogOut, UserCheck, RotateCcw, Truck, Users, Network, Trash2
 } from 'lucide-react';
-import { getNetworkRole, getServerIP } from '@/lib/supabase';
+import { getNetworkRole, getServerIP, replaceLocalTable, supabase } from '@/lib/supabase';
 import { isAdminPinConfigured, saveAdminPinCredential, verifyAdminPin } from '@/utils/adminAccess';
+import { isCounterModuleRestricted, readCachedCounterPermissions, type CounterPermissions } from '@/utils/counterPermissions';
+import { createUserPasswordCredential, verifyUserPassword, type PosUserRecord } from '@/utils/userAccounts';
 
 export type Page = 
   | 'pos' 
@@ -38,10 +40,14 @@ export function Sidebar({
   page,
   onNavigate,
   storeName,
+  counterPermissions = readCachedCounterPermissions(),
+  onMasterAdminChange,
 }: {
   page: Page;
   onNavigate: (p: Page) => void;
   storeName: string;
+  counterPermissions?: CounterPermissions;
+  onMasterAdminChange?: (isMasterAdmin: boolean) => void;
 }) {
   const isCounter = getNetworkRole() === 'client' || localStorage.getItem('pos_device_role') === 'counter';
   const serverIP = getServerIP();
@@ -58,6 +64,18 @@ export function Sidebar({
   
   const [activeUser, setActiveUser] = useState<string>(() => localStorage.getItem('pos_active_user') || fallbackStore);
   const [userNameInput, setUserNameInput] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [userError, setUserError] = useState('');
+  const [userAccounts, setUserAccounts] = useState<PosUserRecord[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('pos_users_list') || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
 
   // Use refs for click timing so the fifth-click side effect runs exactly once,
   // including under React StrictMode in development builds.
@@ -70,6 +88,31 @@ export function Sidebar({
       setActiveUser(storeName);
     }
   }, [storeName]);
+
+  useEffect(() => {
+    let active = true;
+    const syncAccounts = async () => {
+      try {
+        const { data } = await supabase.from('pos_users_list').select('*');
+        if (!active) return;
+        if (data?.length) {
+          const accounts = (data as PosUserRecord[]).filter((user) => Boolean(user.name));
+          setUserAccounts(accounts);
+          localStorage.setItem('pos_users_list', JSON.stringify(accounts));
+        } else if (!isCounter && userAccounts.length > 0) {
+          await replaceLocalTable('pos_users_list', userAccounts);
+        }
+      } catch {
+        // Local cached accounts remain usable while the LAN server is offline.
+      }
+    };
+    void syncAccounts();
+    const interval = window.setInterval(syncAccounts, 4000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [isCounter]);
 
   useEffect(() => () => {
     if (tapTimerRef.current !== null) window.clearTimeout(tapTimerRef.current);
@@ -133,7 +176,10 @@ export function Sidebar({
 
     localStorage.setItem('pos_device_role', 'server');
     localStorage.setItem('pos_network_role', 'server');
+    localStorage.setItem('is_master_admin', 'true');
+    onMasterAdminChange?.(true);
     localStorage.setItem('pos_active_user', 'TECHI');
+    window.dispatchEvent(new Event('pos-network-role-changed'));
     setActiveUser('TECHI');
     setAdminPin('');
     setAdminPinConfirm('');
@@ -141,13 +187,71 @@ export function Sidebar({
     setAdminPinOpen(false);
   }
 
-  function handleLoginUser(name: string) {
+  async function saveUserAccounts(accounts: PosUserRecord[]) {
+    setUserAccounts(accounts);
+    localStorage.setItem('pos_users_list', JSON.stringify(accounts));
+    try {
+      // Keep an explicit empty-list row so Counter PCs can distinguish "no users" from an offline server.
+      const tableRows = accounts.length ? accounts : [{ id: '__empty_user_list__', name: '', created_at: new Date().toISOString() }];
+      await replaceLocalTable('pos_users_list', tableRows);
+      setUserError('');
+    } catch {
+      setUserError('Saved on this PC. The Main Server could not be reached to sync the user list.');
+    }
+  }
+
+  async function handleLoginUser(name: string) {
     const clean = name.trim();
     if (!clean) return;
+    const account = userAccounts.find((user) => user.name.toLowerCase() === clean.toLowerCase());
+    if (userAccounts.length > 0 && !account) {
+      setUserError('Choose a saved account or add this person as a user first.');
+      return;
+    }
+    if (account?.passwordCredential && !(await verifyUserPassword(loginPassword, account.passwordCredential))) {
+      setUserError('Incorrect password for this user.');
+      return;
+    }
     localStorage.setItem('pos_active_user', clean);
     setActiveUser(clean);
     setUserModalOpen(false);
     setUserNameInput('');
+    setLoginPassword('');
+    setUserError('');
+  }
+
+  async function handleAddUser() {
+    const name = newUserName.trim();
+    if (!name) {
+      setUserError('Enter a name for the new user.');
+      return;
+    }
+    if (userAccounts.some((user) => user.name.toLowerCase() === name.toLowerCase())) {
+      setUserError('A user with this name already exists.');
+      return;
+    }
+    try {
+      const passwordCredential = newUserPassword ? await createUserPasswordCredential(newUserPassword) : undefined;
+      const next: PosUserRecord[] = [{
+        id: `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        ...(passwordCredential ? { passwordCredential } : {}),
+        created_at: new Date().toISOString(),
+      }, ...userAccounts];
+      await saveUserAccounts(next);
+      setUserNameInput(name);
+      setNewUserName('');
+      setNewUserPassword('');
+    } catch (error) {
+      setUserError(error instanceof Error ? error.message : 'Could not create this user.');
+    }
+  }
+
+  async function handleDeleteUser(user: PosUserRecord) {
+    if (isCounter || !window.confirm(`Remove the saved account for ${user.name}?`)) return;
+    const next = userAccounts.filter((current) => current.id !== user.id);
+    await saveUserAccounts(next);
+    if (activeUser.toLowerCase() === user.name.toLowerCase()) handleLogoutUser();
   }
 
   function handleLogoutUser() {
@@ -156,25 +260,15 @@ export function Sidebar({
     setUserModalOpen(false);
   }
 
-  // Sirf Sales & Reports aur Top Selling par lock lagega
+  // Main Server's saved authority matrix is enforced by App and reflected here.
   function isRestrictedScreen(p: Page): boolean {
-    return p === 'sales' || p === 'fast-moving';
+    return isCounterModuleRestricted(p, counterPermissions);
   }
 
   const handleTabClick = (item: { id: Page; label: string }) => {
-    const shouldLock = isCounter && isRestrictedScreen(item.id as Page) && oneTimeAllowedPage !== item.id;
-
-    if (!shouldLock) {
-      if (oneTimeAllowedPage === item.id) {
-        setOneTimeAllowedPage(null);
-      }
-      onNavigate(item.id as Page);
-      setCatalogOpen(false);
-      return;
-    }
-
-    setLockedTarget(item as any);
-    setRequestStatus('idle');
+    if (oneTimeAllowedPage === item.id) setOneTimeAllowedPage(null);
+    // App owns the shared permission gate and request flow for every navigation entry point.
+    onNavigate(item.id as Page);
     setCatalogOpen(false);
   };
 
@@ -380,7 +474,7 @@ export function Sidebar({
       {/* User Switch Modal */}
       {userModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-[2px] p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-slate-800 animate-in fade-in zoom-in-95 duration-150">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto p-6 text-slate-800 animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div className="flex items-center gap-2">
                 <UserCheck className="h-5 w-5 text-emerald-600" />
@@ -406,12 +500,80 @@ export function Sidebar({
                   value={userNameInput}
                   onChange={(e) => setUserNameInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleLoginUser(userNameInput);
+                    if (e.key === 'Enter') void handleLoginUser(userNameInput);
                   }}
                   autoFocus
                   className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
               </div>
+
+              {userAccounts.length > 0 && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">Saved Users</label>
+                  <div className="max-h-28 overflow-y-auto space-y-1 rounded-xl border border-slate-200 p-1.5">
+                    {userAccounts.map((account) => (
+                      <div key={account.id} className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => { setUserNameInput(account.name); setUserError(''); }}
+                          className={`flex-1 rounded-lg px-2.5 py-2 text-left text-xs font-semibold ${userNameInput === account.name ? 'bg-emerald-50 text-emerald-800' : 'text-slate-700 hover:bg-slate-50'}`}
+                        >
+                          {account.name}{account.passwordCredential ? ' · password protected' : ''}
+                        </button>
+                        {!isCounter && (
+                          <button
+                            type="button"
+                            title={`Delete ${account.name}`}
+                            onClick={() => void handleDeleteUser(account)}
+                            className="rounded-lg p-2 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Password (if this user has one)</label>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={loginPassword}
+                  onChange={(e) => { setLoginPassword(e.target.value); setUserError(''); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void handleLoginUser(userNameInput); }}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+              </div>
+
+              <div className="space-y-2 border-t border-slate-100 pt-3">
+                <p className="text-xs font-bold text-slate-700">Add Cashier / User</p>
+                <input
+                  type="text"
+                  value={newUserName}
+                  onChange={(e) => { setNewUserName(e.target.value); setUserError(''); }}
+                  placeholder="New user name"
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={newUserPassword}
+                  onChange={(e) => { setNewUserPassword(e.target.value); setUserError(''); }}
+                  placeholder="Optional password"
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleAddUser()}
+                  className="w-full rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700 hover:bg-indigo-100"
+                >
+                  Add User
+                </button>
+              </div>
+              {userError && <p role="alert" className="text-xs font-medium text-red-600">{userError}</p>}
             </div>
 
             <div className="flex items-center justify-between pt-3 border-t border-slate-100">
@@ -426,7 +588,7 @@ export function Sidebar({
 
               <button
                 type="button"
-                onClick={() => handleLoginUser(userNameInput || activeUser)}
+                onClick={() => void handleLoginUser(userNameInput || activeUser)}
                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors cursor-pointer"
               >
                 Set User
@@ -519,7 +681,11 @@ export function Sidebar({
   );
 }
 
-export function MobileNav({ page, onNavigate }: { page: Page; onNavigate: (p: Page) => void }) {
+export function MobileNav({ page, onNavigate, counterPermissions = readCachedCounterPermissions() }: {
+  page: Page;
+  onNavigate: (p: Page) => void;
+  counterPermissions?: CounterPermissions;
+}) {
   const isCounter = getNetworkRole() === 'client' || localStorage.getItem('pos_device_role') === 'counter';
 
   return (
@@ -527,13 +693,12 @@ export function MobileNav({ page, onNavigate }: { page: Page; onNavigate: (p: Pa
       {NAV_ITEMS.map((item) => {
         const Icon = item.icon;
         const active = page === item.id;
-        const isLocked = isCounter && (item.id === 'sales' || item.id === 'fast-moving');
+        const isLocked = isCounter && isCounterModuleRestricted(item.id, counterPermissions);
 
         return (
           <button
             key={item.id}
             onClick={() => {
-              if (isLocked) return;
               onNavigate(item.id);
             }}
             className={`min-w-[64px] flex-1 flex flex-col items-center gap-1 py-2 text-[10px] font-medium ${

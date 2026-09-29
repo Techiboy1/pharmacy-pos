@@ -95,25 +95,73 @@ function setLocalData<T>(key: string, val: T): void {
 
 // Network Helpers
 export function getNetworkRole(): 'server' | 'client' {
-  return (localStorage.getItem('pos_network_role') as 'server' | 'client') || 'server';
+  const deviceRole = localStorage.getItem('pos_device_role');
+  if (deviceRole === 'counter') return 'client';
+  if (deviceRole === 'server') return 'server';
+  const configured = localStorage.getItem('pos_network_role');
+  if (configured === 'server' || configured === 'client') return configured;
+  return 'server';
 }
 
+const SYNCABLE_LOCAL_RECORD_KEYS = new Set([
+  'pos_purchases', 'pos_vendors', 'pos_batches', 'pos_customer_history',
+  'pos_customer_ledger', 'pos_returns', 'pos_return_items', 'pos_purchase_items',
+]);
+
 export function getServerIP(): string {
-  return localStorage.getItem('pos_server_ip') || '192.168.1.1';
+  return localStorage.getItem('pos_server_ip') || '192.168.1.50';
+}
+
+function getServerPort(): string {
+  return localStorage.getItem('pos_server_port') || '45455';
+}
+
+/** Verify that shared local data is reachable before creating a backup/export from a Counter PC. */
+export async function isMainServerReachable(): Promise<boolean> {
+  if (getNetworkRole() === 'server') return true;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 2500);
+  try {
+    const response = await fetch(`http://${getServerIP()}:${getServerPort()}/api/ping`, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 // Global hook: Main PC handles queries sent over LAN cable
 if (typeof window !== 'undefined') {
   (window as any).__handleLanRequest = async (payload: {
     table: string;
-    action: 'select' | 'insert' | 'update' | 'delete';
+    action: 'select' | 'insert' | 'update' | 'delete' | 'replace' | 'storage_replace';
     filters?: any[];
     data?: any;
     order?: { col: string; ascending: boolean };
     limit?: number;
   }) => {
     const { table, action, filters = [], data, order, limit } = payload;
+
+    if (action === 'storage_replace') {
+      if (!data || !SYNCABLE_LOCAL_RECORD_KEYS.has(data.key)) throw new Error('This local record cannot be restored over LAN.');
+      localStorage.setItem(data.key, JSON.stringify(data.value));
+      window.dispatchEvent(new CustomEvent('pos-local-data-changed', { detail: { key: data.key } }));
+      return true;
+    }
+
     let list: any[] = getLocalData(table, []);
+
+    if (action === 'replace') {
+      if (!Array.isArray(data)) throw new Error('Replacement data must be an array.');
+      localStorage.setItem(`pos_db_${table}`, JSON.stringify(data));
+      window.dispatchEvent(new CustomEvent('pos-local-data-changed', { detail: { table } }));
+      return data;
+    }
 
     if (action === 'select') {
       for (const f of filters) {
@@ -184,17 +232,52 @@ if (typeof window !== 'undefined') {
 async function sendLanQuery(payload: any): Promise<any> {
   const ip = getServerIP();
   try {
-    const res = await fetch(`http://${ip}:45455/api/sync`, {
+    const res = await fetch(`http://${ip}:${getServerPort()}/api/sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const json = await res.json();
+    if (!res.ok || json.error) throw new Error(json.error || `LAN request failed (${res.status}).`);
     return json.data;
   } catch (e) {
-    console.error(`Failed to connect to Main PC at ${ip}:45455`, e);
+    console.error(`Failed to connect to Main PC at ${ip}:${getServerPort()}`, e);
     return null;
   }
+}
+
+/** Replace a local adapter table, forwarding the operation to the Main PC over LAN on Counter PCs. */
+export async function replaceLocalTable(table: string, rows: unknown[]): Promise<void> {
+  if (!Array.isArray(rows)) throw new Error(`Invalid data for ${table}.`);
+
+  if (getNetworkRole() === 'client') {
+    const result = await sendLanQuery({ table, action: 'replace', data: rows });
+    if (!Array.isArray(result)) throw new Error(`Main Server did not confirm saving ${table}.`);
+    return;
+  }
+
+  try {
+    localStorage.setItem(`pos_db_${table}`, JSON.stringify(rows));
+  } catch (error) {
+    throw new Error(`Could not save ${table} to local storage: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('pos-local-data-changed', { detail: { table } }));
+  }
+}
+
+/** Restore an allowlisted app-local record on this PC or the Main PC over the local LAN. */
+export async function replaceLocalRecord(key: string, value: unknown): Promise<void> {
+  if (!SYNCABLE_LOCAL_RECORD_KEYS.has(key)) throw new Error(`Local record ${key} cannot be restored.`);
+  if (getNetworkRole() === 'client') {
+    const result = await sendLanQuery({ table: '', action: 'storage_replace', data: { key, value } });
+    if (result !== true) throw new Error(`Main Server did not confirm restoring ${key}.`);
+    localStorage.setItem(key, JSON.stringify(value));
+    window.dispatchEvent(new CustomEvent('pos-local-data-changed', { detail: { key } }));
+    return;
+  }
+  localStorage.setItem(key, JSON.stringify(value));
+  window.dispatchEvent(new CustomEvent('pos-local-data-changed', { detail: { key } }));
 }
 
 export const supabase = {

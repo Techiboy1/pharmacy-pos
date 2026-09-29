@@ -54,6 +54,13 @@ export function InventoryScreen() {
 
   useEffect(() => {
     fetchMeds();
+    const refreshAfterRestore = () => { void fetchMeds(); };
+    window.addEventListener('pos-local-data-changed', refreshAfterRestore);
+    window.addEventListener('pos-database-restored', refreshAfterRestore);
+    return () => {
+      window.removeEventListener('pos-local-data-changed', refreshAfterRestore);
+      window.removeEventListener('pos-database-restored', refreshAfterRestore);
+    };
   }, []);
 
   async function fetchMeds() {

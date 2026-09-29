@@ -361,7 +361,7 @@ export function ReturnScreen({ settings }: { settings?: StoreSettings | null }) 
     }
 
     const returnInvoiceNo = `RET-${Date.now().toString().slice(-6)}`;
-    const cashierName = localStorage.getItem('pos_active_user') || 'TECHI';
+    const cashierName = localStorage.getItem('pos_active_user') || settings?.name || 'Pharmacy Store';
 
     // 1. Restock to master medicines table
     try {
@@ -887,7 +887,7 @@ export function ReturnScreen({ settings }: { settings?: StoreSettings | null }) 
               </div>
               <div className="flex justify-between text-slate-600">
                 <span>Cashier / User:</span>
-                <strong className="text-slate-800">{localStorage.getItem('pos_active_user') || 'TECHI'}</strong>
+                <strong className="text-slate-800">{localStorage.getItem('pos_active_user') || settings?.name || 'Pharmacy Store'}</strong>
               </div>
 
               <div className="border-t border-slate-100 pt-2 flex justify-between">

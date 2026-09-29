@@ -1,17 +1,53 @@
 import { useState, useEffect, type FormEvent } from 'react';
 import { 
   Store, Save, CheckCircle2, AlertCircle, 
-  Download, Upload, FileSpreadsheet, Key
+  Download, Upload, FileSpreadsheet, Key, Unlink
 } from 'lucide-react';
-import { supabase, type StoreSettings } from '@/lib/supabase';
+import { getNetworkRole, isMainServerReachable, replaceLocalRecord, replaceLocalTable, supabase, type StoreSettings } from '@/lib/supabase';
 import { getLicenseInfo, getMachineId } from '../utils/licenseManager';
+
+const BACKUP_TABLES = [
+  'medicines', 'sales', 'sale_items', 'returns', 'return_items',
+  'purchases', 'purchase_items', 'suppliers', 'customer_history',
+  'customer_ledger', 'store_settings', 'pos_users_list',
+  'counter_module_permissions', 'counter_access_requests',
+] as const;
+
+const LOCAL_RECORD_KEYS = [
+  'pos_purchases', 'pos_vendors', 'pos_batches', 'pos_customer_history',
+  'pos_customer_ledger', 'pos_returns', 'pos_return_items', 'pos_purchase_items',
+] as const;
+
+function readLocalArray(key: string): any[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function downloadTextFile(contents: string, fileName: string, mimeType: string) {
+  const url = URL.createObjectURL(new Blob([contents], { type: mimeType }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 export function SettingsScreen({
   settings,
   setSettings,
+  isMasterAdmin,
+  onDeactivateLicense,
 }: {
   settings: StoreSettings | null;
   setSettings: (s: StoreSettings | null) => void;
+  isMasterAdmin?: boolean;
+  onDeactivateLicense?: () => void;
 }) {
   const [name, setName] = useState(settings?.name || '');
   const [phone, setPhone] = useState(settings?.phone || '');
@@ -23,15 +59,11 @@ export function SettingsScreen({
 
   const machineId = getMachineId();
   const licenseInfo = getLicenseInfo();
-  const activeLicenseKey = localStorage.getItem('pos_license_key') ||
-    (settings as any)?.license_key ||
-    'No license key saved on this device';
+  const activeLicenseKey = localStorage.getItem('pos_license_key') || 'No license key saved on this device';
   const licenseBadgeText = licenseInfo.status === 'active'
     ? licenseInfo.isLifetime
       ? 'Lifetime License'
-      : licenseInfo.daysLeft === 0
-        ? 'Expires today'
-        : `${licenseInfo.daysLeft} days remaining`
+      : `Trial License - Expires: ${licenseInfo.expiry}`
     : licenseInfo.status === 'expired'
       ? 'Expired'
       : licenseInfo.status === 'invalid'
@@ -45,7 +77,7 @@ export function SettingsScreen({
   const licenseDescription = licenseInfo.status === 'active'
     ? licenseInfo.isLifetime
       ? 'This device has a lifetime license.'
-      : `Valid through ${licenseInfo.expiry}.`
+      : `Trial License - Expires: ${licenseInfo.expiry}${licenseInfo.daysLeft === null ? '' : ` (${licenseInfo.daysLeft} days remaining)`}.`
     : licenseInfo.status === 'expired'
       ? `This license expired on ${licenseInfo.expiry}.`
       : licenseInfo.status === 'invalid'
@@ -112,22 +144,47 @@ export function SettingsScreen({
   // Backup & Export Handlers
   async function exportToExcel() {
     try {
-      const { data: meds } = await supabase.from('medicines').select('*');
-      if (!meds || meds.length === 0) {
-        showToast('err', 'No medicine records to export');
-        return;
+      if (!(await isMainServerReachable())) throw new Error('Main Server is unavailable on the local network.');
+      const [{ data: meds }, { data: supplierRows }] = await Promise.all([
+        supabase.from('medicines').select('*'),
+        supabase.from('suppliers').select('*'),
+      ]);
+      const vendors = supplierRows?.length ? supplierRows : readLocalArray('pos_vendors');
+      const supplierById = new Map<string, any>();
+      for (const supplier of vendors || []) {
+        if (supplier.id !== undefined) supplierById.set(String(supplier.id), supplier);
+        if (supplier.company_name) supplierById.set(String(supplier.company_name).toLowerCase(), supplier);
+        if (supplier.name) supplierById.set(String(supplier.name).toLowerCase(), supplier);
       }
-      const csvContent = 'data:text/csv;charset=utf-8,' + 
-        ['Name,Sale Price,Cost Price,Stock Quantity,Category,Batch No,Expiry Date']
-          .concat(meds.map((m: any) => `"${m.name}",${m.sale_price},${m.cost_price},${m.stock_quantity},"${m.category || ''}","${m.batch_no || ''}","${m.expiry_date || ''}"`))
-          .join('\n');
-      const encodedUri = encodeURI(csvContent);
-      const link = document.createElement('a');
-      link.setAttribute('href', encodedUri);
-      link.setAttribute('download', `pharmacy_inventory_${new Date().toISOString().split('T')[0]}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+
+      const columns = [
+        'Medicine ID', 'Name', 'Category', 'Batch No', 'Expiry Date', 'Purchase/Cost Price',
+        'Sale Price', 'Strip Sale Price', 'Tablet Sale Price', 'Stock Quantity',
+        'Strips per Box', 'Tablets per Strip', 'Supplier Name', 'Supplier Phone',
+        'Booker Name', 'Booker Phone', 'Manager Phone', 'Supervisor Phone',
+      ];
+      const escapeCell = (value: unknown) => {
+        let text = value === null || value === undefined ? '' : String(value);
+        if (typeof value === 'string' && /^[=+@\-\t\r]/.test(text)) text = `'${text}`;
+        return `"${text.replace(/"/g, '""')}"`;
+      };
+      const rows = (meds || []).map((medicine: any) => {
+        const supplier = supplierById.get(String(medicine.supplier_id ?? medicine.vendor_id ?? ''))
+          || supplierById.get(String(medicine.supplier_name ?? medicine.supplier ?? '').toLowerCase())
+          || {};
+        return [
+          medicine.id, medicine.name, medicine.category, medicine.batch_no, medicine.expiry_date,
+          medicine.purchase_price ?? medicine.cost_price, medicine.sale_price,
+          medicine.strip_sale_price, medicine.tablet_sale_price, medicine.stock_quantity,
+          medicine.strips_per_box, medicine.tablets_per_strip,
+          medicine.supplier_name || medicine.supplier || supplier.company_name || supplier.name,
+          medicine.supplier_phone || supplier.supplier_phone || supplier.phone,
+          medicine.booker_name || supplier.booker_name, medicine.booker_phone || supplier.booker_phone,
+          medicine.manager_phone || supplier.manager_phone, medicine.supervisor_phone || supplier.supervisor_phone,
+        ];
+      });
+      const csvContent = '\uFEFF' + [columns, ...rows].map((row) => row.map(escapeCell).join(',')).join('\r\n');
+      downloadTextFile(csvContent, `pharmacy_inventory_${new Date().toISOString().split('T')[0]}.csv`, 'text/csv;charset=utf-8');
       showToast('ok', 'Inventory exported successfully!');
     } catch {
       showToast('err', 'Export failed');
@@ -136,25 +193,44 @@ export function SettingsScreen({
 
   async function handleBackup() {
     try {
-      const [{ data: meds }, { data: sls }, { data: items }] = await Promise.all([
-        supabase.from('medicines').select('*'),
-        supabase.from('sales').select('*'),
-        supabase.from('sale_items').select('*'),
-      ]);
+      if (!(await isMainServerReachable())) throw new Error('Main Server is unavailable on the local network.');
+      const tableResults = await Promise.all(BACKUP_TABLES.map(async (table) => {
+        const { data, error } = await supabase.from(table).select('*');
+        if (error) throw new Error(`Could not read ${table} for backup.`);
+        return [table, data || []] as const;
+      }));
+      const tables = Object.fromEntries(tableResults) as Record<string, any[]>;
+      const localData = Object.fromEntries(LOCAL_RECORD_KEYS.map((key) => [key, readLocalArray(key)]));
+
+      if (!tables.purchases.length) tables.purchases = localData.pos_purchases;
+      if (!tables.suppliers.length) tables.suppliers = localData.pos_vendors;
+      if (!tables.purchase_items.length) {
+        tables.purchase_items = tables.purchases.flatMap((purchase: any) =>
+          Array.isArray(purchase.items) ? purchase.items.map((item: any) => ({ ...item, purchase_id: purchase.id })) : [],
+        );
+      }
+      if (!tables.returns.length) {
+        tables.returns = tables.sales.filter((sale: any) => sale.payment_type === 'Refund' || Number(sale.net_payable) < 0);
+      }
+      const returnIds = new Set(tables.returns.map((record: any) => record.id));
+      if (!tables.return_items.length) tables.return_items = tables.sale_items.filter((item: any) => returnIds.has(item.sale_id));
+      if (!tables.customer_history.length) tables.customer_history = localData.pos_customer_history;
+      if (!tables.customer_ledger.length) tables.customer_ledger = localData.pos_customer_ledger;
+
+      // Sales queries include joined sale_items for display; store the normalized tables once.
+      tables.sales = tables.sales.map((sale: any) => {
+        const normalizedSale = { ...sale };
+        delete normalizedSale.sale_items;
+        return normalizedSale;
+      });
       const backupData = {
+        format: 'pharmacy-pos-offline-backup',
+        schema_version: 2,
         timestamp: new Date().toISOString(),
-        store: settings,
-        medicines: meds || [],
-        sales: sls || [],
-        sale_items: items || [],
+        tables,
+        localData,
       };
-      const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `pharmacy_backup_${new Date().toISOString().split('T')[0]}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadTextFile(JSON.stringify(backupData, null, 2), `pharmacy_backup_${new Date().toISOString().split('T')[0]}.json`, 'application/json');
       showToast('ok', 'Database backup downloaded safely!');
     } catch {
       showToast('err', 'Backup creation failed');
@@ -172,18 +248,86 @@ export function SettingsScreen({
       reader.onload = async (evt) => {
         try {
           const parsed = JSON.parse(evt.target?.result as string);
-          if (parsed && Array.isArray(parsed.medicines)) {
-            if (window.confirm(`Restore will import ${parsed.medicines.length} medicines. Continue?`)) {
-              showToast('ok', 'Backup data parsed successfully!');
+          const backupTables = parsed?.tables && typeof parsed.tables === 'object' ? parsed.tables : parsed;
+          if (!backupTables || typeof backupTables !== 'object' || Array.isArray(backupTables)) throw new Error('This is not a pharmacy backup.');
+          const hasKnownTable = BACKUP_TABLES.some((table) => Array.isArray(backupTables[table])) || Array.isArray(parsed.medicines);
+          if (!hasKnownTable) throw new Error('This backup does not contain recognized pharmacy tables.');
+          const isUniversalBackup = parsed.schema_version >= 2 || parsed.format === 'pharmacy-pos-offline-backup';
+          if (isUniversalBackup && BACKUP_TABLES.some((table) => !Array.isArray(backupTables[table]))) {
+            throw new Error('A universal backup is missing one or more tables.');
+          }
+          if (parsed.localData && typeof parsed.localData === 'object' &&
+            LOCAL_RECORD_KEYS.some((key) => parsed.localData[key] !== undefined && !Array.isArray(parsed.localData[key]))) {
+            throw new Error('The backup contains an invalid local records section.');
+          }
+
+          const tablesToRestore: Record<string, any[]> = {};
+          for (const table of BACKUP_TABLES) {
+            if (Array.isArray(backupTables[table])) tablesToRestore[table] = backupTables[table];
+            else if (isUniversalBackup) tablesToRestore[table] = [];
+          }
+          // Support the first-generation backup shape.
+          if (!Array.isArray(tablesToRestore.store_settings) && parsed.store && typeof parsed.store === 'object') {
+            tablesToRestore.store_settings = [parsed.store];
+          }
+          if (!Array.isArray(tablesToRestore.medicines) && Array.isArray(parsed.medicines)) tablesToRestore.medicines = parsed.medicines;
+          if (!Array.isArray(tablesToRestore.sales) && Array.isArray(parsed.sales)) tablesToRestore.sales = parsed.sales;
+          if (!Array.isArray(tablesToRestore.sale_items) && Array.isArray(parsed.sale_items)) tablesToRestore.sale_items = parsed.sale_items;
+
+          const counts = Object.entries(tablesToRestore).map(([table, rows]) => `${table}: ${rows.length}`).join('\n');
+          if (!window.confirm(`This will replace the backed-up local business records with the selected backup.\n\n${counts}\n\nContinue?`)) return;
+
+          for (const table of BACKUP_TABLES) {
+            if (tablesToRestore[table]) {
+              const rows = table === 'pos_users_list' && tablesToRestore[table].length === 0
+                ? [{ id: '__empty_user_list__', name: '', created_at: new Date().toISOString() }]
+                : tablesToRestore[table];
+              await replaceLocalTable(table, rows);
             }
           }
+
+          const localData = parsed.localData && typeof parsed.localData === 'object' ? parsed.localData : {};
+          for (const key of LOCAL_RECORD_KEYS) {
+            const localRows = Array.isArray(localData[key]) ? localData[key] : undefined;
+            let rows = localRows;
+            if (!rows?.length && key === 'pos_purchases' && Array.isArray(tablesToRestore.purchases)) rows = tablesToRestore.purchases;
+            if (!rows?.length && key === 'pos_vendors' && Array.isArray(tablesToRestore.suppliers)) rows = tablesToRestore.suppliers;
+            if (rows) await replaceLocalRecord(key, rows);
+          }
+
+          if (tablesToRestore.pos_users_list) localStorage.setItem('pos_users_list', JSON.stringify(tablesToRestore.pos_users_list));
+          if (tablesToRestore.counter_module_permissions?.[0]?.permissions) {
+            localStorage.setItem('pos_counter_module_access', JSON.stringify(tablesToRestore.counter_module_permissions[0].permissions));
+          }
+          const restoredSettings = tablesToRestore.store_settings?.[0] || null;
+          setSettings(restoredSettings as StoreSettings | null);
+          window.dispatchEvent(new CustomEvent('pos-database-restored'));
+          showToast('ok', 'All backup tables were restored to local storage.');
         } catch {
-          showToast('err', 'Invalid backup file format');
+          showToast('err', 'Restore failed. Check that this is a valid backup and the local/LAN storage is available.');
         }
       };
       reader.readAsText(file);
     };
     input.click();
+  }
+
+  async function deactivateLicense() {
+    if (!window.confirm('Deactivate this machine’s license and return to the activation screen?')) return;
+    localStorage.removeItem('pos_license_key');
+    if (getNetworkRole() === 'server') {
+      try {
+        const raw = localStorage.getItem('pos_db_store_settings');
+        const rows = raw ? JSON.parse(raw) : [];
+        if (Array.isArray(rows)) {
+          localStorage.setItem('pos_db_store_settings', JSON.stringify(rows.map((row: any) => {
+            const { license_key: _licenseKey, activation_key: _activationKey, ...safeRow } = row;
+            return safeRow;
+          })));
+        }
+      } catch {}
+    }
+    onDeactivateLicense?.();
   }
 
   return (
@@ -207,7 +351,7 @@ export function SettingsScreen({
             className="flex items-center gap-1.5 px-3 py-2 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 rounded-xl text-xs font-bold cursor-pointer transition-colors shadow-xs"
           >
             <FileSpreadsheet className="h-4 w-4" />
-            <span>Excel Export</span>
+            <span>Excel / CSV Export</span>
           </button>
 
           <button
@@ -334,6 +478,17 @@ export function SettingsScreen({
             </div>
           </div>
         </div>
+
+        {(isMasterAdmin ?? localStorage.getItem('is_master_admin') === 'true') && (
+          <button
+            type="button"
+            onClick={deactivateLicense}
+            className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-xs font-bold text-red-700 transition-colors hover:bg-red-100"
+          >
+            <Unlink className="h-4 w-4" />
+            Deactivate License / Unlink Machine
+          </button>
+        )}
       </div>
     </div>
   );
